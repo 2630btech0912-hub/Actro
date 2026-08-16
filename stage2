@@ -1,0 +1,147 @@
+import { GoogleGenAI, Type, Schema } from '@google/genai';
+
+const ai = new GoogleGenAI();
+
+const dependencyResolutionSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    resolved_tasks: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          document_ref: { type: Type.STRING, description: 'Source document title or ID reference' },
+          deadline: {
+            type: Type.STRING,
+            description: 'Resolved deadline string or date representation. If ambiguous, reflect source uncertainty.',
+          },
+          priority: {
+            type: Type.STRING,
+            enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'],
+          },
+          risk_level: {
+            type: Type.STRING,
+            enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'],
+          },
+          risk_explanation: {
+            type: Type.STRING,
+            description: 'Detailed explanation justifying the calculated risk level and bottleneck analysis.',
+          },
+          prerequisites: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                prerequisite_task_title: { type: Type.STRING },
+                reason: { type: Type.STRING },
+              },
+              required: ['prerequisite_task_title', 'reason'],
+            },
+          },
+        },
+        required: [
+          'title',
+          'document_ref',
+          'deadline',
+          'priority',
+          'risk_level',
+          'risk_explanation',
+          'prerequisites',
+        ],
+      },
+    },
+  },
+  required: ['resolved_tasks'],
+};
+
+const SYSTEM_INSTRUCTION = `You are Actra's Critical Path & Dependency Engine.
+Compare newly extracted tasks with the user's existing task graph.
+Identify prerequisite relationships, resolve multi-document deadline bottlenecks, and calculate urgency risk levels relative to the provided CURRENT_TIMESTAMP.
+
+Strict Dependency Rules:
+- Do NOT invent dependencies.
+- Only create a dependency when:
+  1. The source documents explicitly establish it, OR
+  2. The relationship is a clear, indisputable logical prerequisite.
+
+Strict Risk Rules:
+- CRITICAL: Lead time exceeds remaining time before hard deadline, or a strict prerequisite deadline has already passed.
+- HIGH: Remaining window is within 48 hours of estimated prerequisite lead time.
+- MEDIUM: Prerequisite document or step is incomplete, but sufficient time remains.
+- LOW: No blockers and sufficient time.`;
+
+export interface TaskPrerequisite {
+  prerequisite_task_title: string;
+  reason: string;
+}
+
+export interface ResolvedTask {
+  title: string;
+  document_ref: string;
+  deadline: string;
+  priority: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  risk_level: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  risk_explanation: string;
+  prerequisites: TaskPrerequisite[];
+}
+
+export interface DependencyResolutionResult {
+  resolved_tasks: ResolvedTask[];
+}
+
+export async function resolveTaskDependencies(
+  existing_tasks: Array<Record<string, any>>,
+  newly_extracted_tasks: Array<Record<string, any>>,
+  current_date: Date = new Date()
+): Promise<DependencyResolutionResult> {
+  const dynamicTimestamp = current_date.toISOString();
+
+  const userContent = `
+--- REFERENCE TIME ---
+CURRENT_TIMESTAMP: ${dynamicTimestamp}
+
+--- EXISTING USER TASKS ---
+${JSON.stringify(existing_tasks, null, 2)}
+
+--- NEWLY EXTRACTED TASKS ---
+${JSON.stringify(newly_extracted_tasks, null, 2)}
+`;
+
+  const callModel = async (prompt: string) => {
+    return await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        responseMimeType: 'application/json',
+        responseSchema: dependencyResolutionSchema,
+        temperature: 0.1,
+      },
+    });
+  };
+
+  try {
+    const response = await callModel(userContent);
+    let parsedData: DependencyResolutionResult;
+
+    try {
+      parsedData = JSON.parse(response.text || '{}');
+    } catch {
+      // Safe parse failure -> single automated retry with explicit correction prompt
+      const repairPrompt = `The previous JSON response was malformed. Fix all syntax errors and return valid JSON conforming to the schema:\n\n${response.text}`;
+      const retryResponse = await callModel(repairPrompt);
+      parsedData = JSON.parse(retryResponse.text || '{}');
+    }
+
+    if (!Array.isArray(parsedData.resolved_tasks)) {
+      throw new Error('Response missing valid "resolved_tasks" array.');
+    }
+
+    return parsedData;
+  } catch (error) {
+    throw new Error(
+      `Dependency resolution failed: Unable to resolve cross-document critical paths (${error instanceof Error ? error.message : 'Unknown error'})`
+    );
+  }
+}
