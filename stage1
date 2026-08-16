@@ -1,0 +1,182 @@
+import { GoogleGenAI, Type, Schema } from '@google/genai';
+
+const ai = new GoogleGenAI();
+
+// Response Schema Definition
+const documentAnalysisSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    category: {
+      type: Type.STRING,
+      enum: [
+        'Exam',
+        'Scholarship',
+        'Fee',
+        'Internship',
+        'Hackathon',
+        'Event',
+        'General Notice',
+        'Other',
+      ],
+    },
+    action_status: {
+      type: Type.STRING,
+      enum: [
+        'Action Required',
+        'Information Only',
+        'Optional Opportunity',
+        'Already Completed',
+        'Not Relevant',
+      ],
+    },
+    relevance: {
+      type: Type.OBJECT,
+      properties: {
+        applies_to_user: { type: Type.BOOLEAN },
+        score: { type: Type.NUMBER, description: 'Relevance score from 0 to 100' },
+        reasons: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
+        },
+        missing_profile_data: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
+        },
+      },
+      required: ['applies_to_user', 'score', 'reasons', 'missing_profile_data'],
+    },
+    extracted_actions: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          temp_id: { type: Type.STRING },
+          action_title: { type: Type.STRING },
+          explicit_deadline: {
+            type: Type.STRING,
+            nullable: true,
+            description: 'The raw date/time string from text. Do not invent years if missing.',
+          },
+          deadline_confidence: {
+            type: Type.STRING,
+            enum: ['high', 'medium', 'low', 'none'],
+          },
+          lead_time_days_estimate: { type: Type.INTEGER, nullable: true },
+          required_prerequisites: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+          },
+          source_text_quote: {
+            type: Type.STRING,
+            description: 'Exact verbatim quote from the raw text for traceability.',
+          },
+        },
+        required: [
+          'temp_id',
+          'action_title',
+          'explicit_deadline',
+          'deadline_confidence',
+          'lead_time_days_estimate',
+          'required_prerequisites',
+          'source_text_quote',
+        ],
+      },
+    },
+  },
+  required: ['category', 'action_status', 'relevance', 'extracted_actions'],
+};
+
+const SYSTEM_INSTRUCTION = `You are the Actra Action Extraction Engine.
+Your task is to analyze document text, assess applicability against a target profile, and extract actionable facts without summarizing.
+
+Strict Rules:
+- Never hallucinate facts or consequences.
+- If information is missing, return null or an empty array.
+- Label every inference clearly.
+- Determine relevance strictly against the provided profile.
+- Do not invent deadlines. If the document states "August 20" and the year cannot be confidently determined, output "August 20" with a "medium" or "low" deadline_confidence instead of inventing a year.
+- Do not invent eligibility.
+- Do not invent consequences.
+- Preserve uncertainty when the source is ambiguous.
+- Preserve exact verbatim quotes in source_text_quote for complete traceability.`;
+
+export interface ExtractedAction {
+  temp_id: string;
+  action_title: string;
+  explicit_deadline: string | null;
+  deadline_confidence: 'high' | 'medium' | 'low' | 'none';
+  lead_time_days_estimate: number | null;
+  required_prerequisites: string[];
+  source_text_quote: string;
+  document_id: string; // Attached server-side for dashboard traceability
+}
+
+export interface DocumentAnalysisResult {
+  category: string;
+  action_status: string;
+  relevance: {
+    applies_to_user: boolean;
+    score: number;
+    reasons: string[];
+    missing_profile_data: string[];
+  };
+  extracted_actions: ExtractedAction[];
+}
+
+export async function analyzeDocument(
+  raw_document_text: string,
+  user_profile: Record<string, any>,
+  document_id: string
+): Promise<DocumentAnalysisResult> {
+  const userContent = `
+--- TARGET USER PROFILE ---
+${JSON.stringify(user_profile, null, 2)}
+
+--- RAW DOCUMENT TEXT ---
+${raw_document_text}
+`;
+
+  const callModel = async (prompt: string) => {
+    return await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        responseMimeType: 'application/json',
+        responseSchema: documentAnalysisSchema,
+        temperature: 0.1,
+      },
+    });
+  };
+
+  try {
+    const response = await callModel(userContent);
+    let parsedData: any;
+
+    try {
+      parsedData = JSON.parse(response.text || '{}');
+    } catch {
+      // Safe parse failed -> Trigger one-time repair attempt
+      const repairPrompt = `The previous JSON response was malformed. Fix the syntax and return valid JSON adhering strictly to the schema:\n\n${response.text}`;
+      const retryResponse = await callModel(repairPrompt);
+      parsedData = JSON.parse(retryResponse.text || '{}');
+    }
+
+    // Attach document_id to each action for dashboard traceability
+    const enrichedActions: ExtractedAction[] = (parsedData.extracted_actions || []).map(
+      (action: any) => ({
+        ...action,
+        document_id,
+      })
+    );
+
+    return {
+      ...parsedData,
+      extracted_actions: enrichedActions,
+    };
+  } catch (error) {
+    throw new Error(
+      `Document extraction failed: Unable to parse or validate document structure (${error instanceof Error ? error.message : 'Unknown error'})`
+    );
+  }
+}
